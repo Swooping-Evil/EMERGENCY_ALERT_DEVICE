@@ -1,55 +1,26 @@
-/**
- * This module handles the GPS/GNSS communication and location data extraction.
- */
 #include "gps_module.h"
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include "driver/uart.h"
-#include "esp_log.h"
 
-#define GPS_UART_NUM UART_NUM_2
-#define GPS_UART_TX_PIN 17
-#define GPS_UART_RX_PIN 16
-#define GPS_UART_BAUD_RATE 9600
-#define BUF_SIZE 1024
-
-static const char* TAG = "GPS_MODULE";
-static GPSData currentGPSData = {0};
-static char googleMapsUrl[100] = {0};
-static bool gpsInitialized = false;
-
-// Initialize GPS module
-void gps_init() {
-    if (gpsInitialized) return;
-
-    // Configure UART parameters
-    uart_config_t uart_config = {
-        .baud_rate = GPS_UART_BAUD_RATE,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_APB,
-    };
-
-    // Install UART driver
-    ESP_ERROR_CHECK(uart_driver_install(GPS_UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(GPS_UART_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(GPS_UART_NUM, GPS_UART_TX_PIN, GPS_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-
-    gpsInitialized = true;
-
-    ESP_LOGI(TAG, "GPS module initialized");
+GPSModule::GPSModule(int rxPin, int txPin, int baudRate)
+    : gpsSerial(new SoftwareSerial(rxPin, txPin)),
+      currentGPSData{},
+      googleMapsUrl{},
+      gpsInitialized(false) {
+    gpsSerial->begin(baudRate);
 }
 
-// Parse NMEA sentence and extract GPS data
-static bool parseGPSData(const char* nmea) {
+bool GPSModule::begin() {
+    if (gpsInitialized) return true;
+
+    // Initial setup if needed
+    gpsInitialized = true;
+    return true;
+}
+
+bool GPSModule::parseGPSData(const char* nmea) {
     if (strncmp(nmea, "$GPRMC", 6) != 0 && strncmp(nmea, "$GNRMC", 6) != 0) {
         return false;
     }
 
-    // Sample format: $GPRMC,053508.00,A,1725.64574,N,07835.11697,E,0.041,,121217,,,D*79
     char status;
     char latDir, longDir;
     char latDeg[3], latMin[10], longDeg[4], longMin[10];
@@ -116,15 +87,10 @@ static bool parseGPSData(const char* nmea) {
     return true;
 }
 
-// Update GPS data by reading from UART
-bool gps_update() {
-    if (!gpsInitialized) {
-        ESP_LOGE(TAG, "GPS module not initialized");
-        return false;
-    }
+bool GPSModule::update() {
+    if (!gpsInitialized) return false;
 
-    uint8_t data[BUF_SIZE];
-    char nmeaSentence[BUF_SIZE];
+    char nmeaSentence[100];
     int nmeaIndex = 0;
     bool foundValidData = false;
     int retry = 0;
@@ -132,49 +98,37 @@ bool gps_update() {
 
     // Try to get a valid GPS reading, with maximum retries
     while (!foundValidData && retry < maxRetry) {
-        int length = uart_read_bytes(GPS_UART_NUM, data, BUF_SIZE - 1, 200 / portTICK_PERIOD_MS);
+        while (gpsSerial->available()) {
+            char c = gpsSerial->read();
 
-        if (length > 0) {
-            data[length] = 0; // Null-terminate the data
-
-            // Process each byte
-            for (int i = 0; i < length; i++) {
-                char c = data[i];
-
-                if (c == '$') {
-                    // Start of a new NMEA sentence
-                    nmeaIndex = 0;
-                    nmeaSentence[nmeaIndex++] = c;
-                } else if (c == '\r' || c == '\n') {
-                    if (nmeaIndex > 0) {
-                        // End of NMEA sentence
-                        nmeaSentence[nmeaIndex] = 0;
-                        if (parseGPSData(nmeaSentence)) {
-                            foundValidData = true;
-                            break;
-                        }
+            if (c == '$') {
+                // Start of a new NMEA sentence
+                nmeaIndex = 0;
+                nmeaSentence[nmeaIndex++] = c;
+            } else if (c == '\r' || c == '\n') {
+                if (nmeaIndex > 0) {
+                    // End of NMEA sentence
+                    nmeaSentence[nmeaIndex] = 0;
+                    if (parseGPSData(nmeaSentence)) {
+                        foundValidData = true;
+                        break;
                     }
-                } else if (nmeaIndex < BUF_SIZE - 1) {
-                    nmeaSentence[nmeaIndex++] = c;
                 }
+            } else if (nmeaIndex < 99) {
+                nmeaSentence[nmeaIndex++] = c;
             }
         }
 
-        retry++;
-    }
-
-    if (foundValidData) {
-        ESP_LOGI(TAG, "GPS data updated: Lat=%.6f, Long=%.6f",
-                currentGPSData.latitude, currentGPSData.longitude);
-    } else {
-        ESP_LOGW(TAG, "Failed to update GPS data after %d attempts", maxRetry);
+        if (!foundValidData) {
+            delay(200);
+            retry++;
+        }
     }
 
     return foundValidData;
 }
 
-// Get the latest GPS data
-bool gps_getData(GPSData* data) {
+bool GPSModule::getData(GPSData* data) {
     if (!currentGPSData.isValid) {
         return false;
     }
@@ -183,30 +137,41 @@ bool gps_getData(GPSData* data) {
     return true;
 }
 
-// Check if GPS has a fix
-bool gps_isFixed() {
+bool GPSModule::isFixed() {
     return currentGPSData.isValid;
 }
 
-// Put GPS into low power mode
-void gps_sleep() {
-    // Send low power mode command to GPS module
-    // This depends on the specific GPS module being used
-    const char* sleepCmd = "$PMTK161,0*28\r\n"; // Example for MTK GPS modules
-    uart_write_bytes(GPS_UART_NUM, sleepCmd, strlen(sleepCmd));
-    ESP_LOGI(TAG, "GPS module entering sleep mode");
+void GPSModule::sleep() {
+    // Sleep mode command for ublox NEO-6M
+    const uint8_t ubxPowerSaveMode[] = {
+        0xB5, 0x62,             // UBX header
+        0x06, 0x11,             // CFG-RXM message
+        0x02, 0x00,             // Payload length (2 bytes)
+        0x08, 0x01,             // reserved and power mode (0x01 = power save)
+        0x22, 0x92              // Checksum
+    };
+
+    for (int i = 0; i < sizeof(ubxPowerSaveMode); i++) {
+        gpsSerial->write(ubxPowerSaveMode[i]);
+    }
 }
 
-// Wake up GPS from low power mode
-void gps_wake() {
-    // Send any character to wake up the GPS
-    const char* wakeCmd = "\r\n";
-    uart_write_bytes(GPS_UART_NUM, wakeCmd, strlen(wakeCmd));
-    ESP_LOGI(TAG, "GPS module waking up");
+void GPSModule::wake() {
+    // Wake up command for ublox NEO-6M
+    const uint8_t ubxContinuousMode[] = {
+        0xB5, 0x62,             // UBX header
+        0x06, 0x11,             // CFG-RXM message
+        0x02, 0x00,             // Payload length (2 bytes)
+        0x08, 0x00,             // reserved and power mode (0x00 = continuous)
+        0x21, 0x91              // Checksum
+    };
+
+    for (int i = 0; i < sizeof(ubxContinuousMode); i++) {
+        gpsSerial->write(ubxContinuousMode[i]);
+    }
 }
 
-// Get Google Maps URL for current location
-const char* gps_getGoogleMapsUrl() {
+const char* GPSModule::getGoogleMapsUrl() {
     if (!currentGPSData.isValid) {
         return NULL;
     }
